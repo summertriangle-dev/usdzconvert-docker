@@ -3,6 +3,7 @@ import os, os.path
 import numpy
 import re
 import usdUtils
+import math
 
 
 import imp
@@ -47,6 +48,37 @@ def getFbxNodeGeometricTransform(fbxNode):
     return fbx.FbxAMatrix(translation, rotation, scale)
 
 
+def convertUVTransformFromFBX(translation, scale, rotation):
+    # from FBX to Blender
+    scale[0] = 1.0 / scale[0]
+    scale[1] = 1.0 / scale[1]
+    rotation = -rotation
+
+    # Blender:  Tuv = T * R * S
+    # USD:      Tuv = S * R * T
+    scaleMatrix = Gf.Matrix4d(Gf.Vec4d(scale[0], scale[1], 1, 1))
+    inverseScaleMatrix = Gf.Matrix4d(Gf.Vec4d(1.0 / scale[0], 1.0 / scale[1], 1, 1))
+
+    rotationMatrix = Gf.Matrix4d(
+         math.cos(rotation),  math.sin(rotation), 0, 0,
+        -math.sin(rotation),  math.cos(rotation), 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1)
+    inverseRotationMatrix = rotationMatrix.GetTranspose()
+
+    translateMatrix = Gf.Matrix4d(1)
+    translateMatrix.SetTranslate(Gf.Vec3d(translation[0], translation[1], 0))
+
+    # translate matrix from Blender to USD
+    transform = scaleMatrix * rotationMatrix * translateMatrix * inverseRotationMatrix  * inverseScaleMatrix
+
+    translation3d = transform.ExtractTranslation()
+    translation[0] = translation3d[0]
+    translation[1] = translation3d[1]
+
+    return translation, scale, math.degrees(rotation)
+
+
 
 class FbxNodeManager(usdUtils.NodeManager):
     def __init__(self, value=None):
@@ -77,11 +109,20 @@ class FbxNodeManager(usdUtils.NodeManager):
 
 
 
+class AnimProperty:
+    def __init__(self, fbxAnimLayer, fbxProperty, timeSpans):
+        self.fbxAnimLayer = fbxAnimLayer
+        self.fbxProperty = fbxProperty
+        self.timeSpans = timeSpans
+
+
+
 class FbxConverter:
-    def __init__(self, fbxPath, usdPath, legacyModifier, copyTextures, verbose):
+    def __init__(self, fbxPath, usdPath, legacyModifier, copyTextures, searchPaths, verbose):
         self.verbose = verbose
         self.legacyModifier = legacyModifier
         self.copyTextures = copyTextures
+        self.searchPaths = searchPaths
         self.asset = usdUtils.Asset(usdPath)
         self.usdStage = None
         self.usdMaterials = {}
@@ -91,6 +132,7 @@ class FbxConverter:
         self.startAnimationTime = 0
         self.stopAnimationTime = 0
         self.skeletonByNode = {} # collect skinned mesh to construct later
+        self.blendShapeByNode = {} # collect blend shapes to construct later
         self.copiedTextures = {} # avoid copying textures more then once
 
         self.extent = [[], []]
@@ -109,6 +151,7 @@ class FbxConverter:
 
         self.nodeManager = FbxNodeManager()
         self.skinning = usdUtils.Skinning(self.nodeManager)
+        self.shapeBlending = usdUtils.ShapeBlending()
 
     
     def loadFbxScene(self, fbxPath):
@@ -158,10 +201,22 @@ class FbxConverter:
                 wrapS = usdUtils.WrapMode.clamp
             if fbxFileTexture.GetWrapModeV() == fbx.FbxTexture.eClamp:
                 wrapT = usdUtils.WrapMode.clamp
-            return fbxFileTexture.GetFileName(), texCoordSet, wrapS, wrapT
+
+            # texture transform
+            mapTransform = None
+            translation = [fbxFileTexture.GetTranslationU(), fbxFileTexture.GetTranslationV()]
+            scale = [fbxFileTexture.GetScaleU(), fbxFileTexture.GetScaleV()]
+            rotation = fbxFileTexture.GetRotationW()
+            if (translation[0] != 0 or translation[1] != 0 or
+                scale[0] != 1 or scale[1] != 1 or
+                rotation != 0):
+                (translation, scale, rotation) = convertUVTransformFromFBX(translation, scale, rotation)
+                mapTransform = usdUtils.MapTransform(translation, scale, rotation)
+
+            return fbxFileTexture.GetFileName(), texCoordSet, wrapS, wrapT, mapTransform
         elif materialProperty.GetSrcObjectCount(fbx.FbxCriteria.ObjectType(fbx.FbxLayeredTexture.ClassId)) > 0:
             pass
-        return '', 'st', usdUtils.WrapMode.repeat, usdUtils.WrapMode.repeat
+        return '', 'st', usdUtils.WrapMode.repeat, usdUtils.WrapMode.repeat, None
 
 
     def processMaterialProperty(self, input, propertyName, property, factorProperty, channels, material, fbxMaterial):
@@ -185,8 +240,8 @@ class FbxConverter:
         materialProperty = fbxMaterial.FindProperty(propertyName)
 
         if materialProperty.IsValid():
-            srcTextureFilename, texCoordSet, wrapS, wrapT = self.getTextureProperties(materialProperty)
-            srcTextureFilename = usdUtils.resolvePath(srcTextureFilename, self.srcFolder)
+            srcTextureFilename, texCoordSet, wrapS, wrapT, mapTransform = self.getTextureProperties(materialProperty)
+            srcTextureFilename = usdUtils.resolvePath(srcTextureFilename, self.srcFolder, self.searchPaths)
             textureFilename = usdUtils.makeValidPath(srcTextureFilename)
 
         if  textureFilename != '' and (self.copyTextures or srcTextureFilename != textureFilename):
@@ -212,7 +267,7 @@ class FbxConverter:
                     scale = [factor, factor, factor]
                 else:
                     scale = factor
-            material.inputs[input] = usdUtils.Map(channels, textureFilename, value, texCoordSet, wrapS, wrapT, scale)
+            material.inputs[input] = usdUtils.Map(channels, textureFilename, value, texCoordSet, wrapS, wrapT, scale, mapTransform)
         else:
             if value is not None:
                 if factor is not None:
@@ -548,6 +603,13 @@ class FbxConverter:
         return None
 
 
+    def getFbxBlenShape(self, fbxNode):
+        fbxMesh = self.getFbxMesh(fbxNode)
+        if fbxMesh is not None and fbxMesh.GetDeformerCount(fbx.FbxDeformer.eBlendShape) > 0:
+            return fbxMesh.GetDeformer(0, fbx.FbxDeformer.eBlendShape)
+        return None
+
+
     def processMesh(self, fbxNode, newPath, underSkeleton, indent):
         usdMesh = UsdGeom.Mesh.Define(self.usdStage, newPath)
 
@@ -821,6 +883,29 @@ class FbxConverter:
                 op.Set(time = timeCode, value = Gf.Vec3f(float(v[0]), float(v[1]), float(v[2])))
 
 
+    def findAnimationProperties(self, fbxObject):
+        animStacksCount = self.fbxScene.GetSrcObjectCount(fbx.FbxCriteria.ObjectType(fbx.FbxAnimStack.ClassId))
+        if animStacksCount < 1:
+            return []
+
+        animProperties = []
+        for animStackIdx in range(animStacksCount):
+            fbxAnimStack = self.fbxScene.GetSrcObject(fbx.FbxCriteria.ObjectType(fbx.FbxAnimStack.ClassId), animStackIdx)
+            for layerIdx in range(fbxAnimStack.GetMemberCount(fbx.FbxCriteria.ObjectType(fbx.FbxAnimLayer.ClassId))):
+                fbxAnimLayer = fbxAnimStack.GetMember(fbx.FbxCriteria.ObjectType(fbx.FbxAnimLayer.ClassId), layerIdx)
+                for curveNodeIdx in range(fbxAnimLayer.GetMemberCount(fbx.FbxCriteria.ObjectType(fbx.FbxAnimCurveNode.ClassId))):
+                    fbxAnimCurveNode = fbxAnimLayer.GetMember(fbx.FbxCriteria.ObjectType(fbx.FbxAnimCurveNode.ClassId), curveNodeIdx)
+                    fbxTimeSpan = fbx.FbxTimeSpan()
+                    fbxAnimCurveNode.GetAnimationInterval(fbxTimeSpan)
+                    for propertyIdx in range(fbxAnimCurveNode.GetDstPropertyCount()):
+                        fbxProperty = fbxAnimCurveNode.GetDstProperty(propertyIdx)
+                        if fbxProperty.GetFbxObject() == fbxObject:
+                            animProperty = AnimProperty(fbxAnimLayer, fbxProperty, fbxTimeSpan)
+                            animProperties.append(animProperty)
+
+        return animProperties
+
+
     def processNodeAnimations(self, fbxNode, usdGeom):
         animStacksCount = self.fbxScene.GetSrcObjectCount(fbx.FbxCriteria.ObjectType(fbx.FbxAnimStack.ClassId))
         if animStacksCount < 1:
@@ -865,6 +950,10 @@ class FbxConverter:
             self.skeletonByNode[fbxNode] = underSkeleton
         elif self.getFbxSkin(fbxNode) is not None:
             self.skeletonByNode[fbxNode] = None
+        elif self.getFbxBlenShape(fbxNode) is not None:
+            usdNode = self.prepareBlendShape(fbxNode, newPath)
+            self.setNodeTransforms(fbxNode, usdNode)
+            self.processNodeAnimations(fbxNode, usdNode)
         else:
             # if we have a geometric transformation we shouldn't propagate it to node's children
             usdNode = None
@@ -984,6 +1073,113 @@ class FbxConverter:
             self.processSkeletalAnimation(skeletonIdx)
 
 
+    def prepareBlendShape(self, fbxNode, path):
+        fbxBlendShape = self.getFbxBlenShape(fbxNode)
+        blendShape = self.shapeBlending.createBlendShape(0)
+        self.blendShapeByNode[fbxNode] = blendShape
+        return blendShape.makeUsdSkeleton(self.usdStage, path)
+
+
+    def processBlendShapes(self):
+        for fbxNode, blendShape in self.blendShapeByNode.iteritems():
+            nodeName = usdUtils.makeValidIdentifier(fbxNode.GetName().split(":")[-1])
+            newPath = blendShape.sdfPath + '/' + nodeName
+            if newPath in self.nodePaths:
+                newPath = newPath + str(self.nodeId)
+                self.nodeId = self.nodeId + 1
+            self.nodePaths[newPath] = newPath
+            usdMesh = self.processMesh(fbxNode, newPath, None, '')
+
+            fbxMesh = fbxNode.GetNodeAttribute()
+            if fbx.FbxNodeAttribute.eSubDiv == fbxMesh.GetAttributeType():
+                fbxMesh = fbxMesh.GetBaseMesh()
+
+            points = [Gf.Vec3f(p[0], p[1], p[2]) for p in fbxMesh.GetControlPoints()]
+
+            blendShapes = []
+            blendShapeTargets = []
+
+            index = 0;
+            fbxBlendShape = self.getFbxBlenShape(fbxNode)
+            for i in range(fbxBlendShape.GetBlendShapeChannelCount()):
+                fbxBlendShapeChannel = fbxBlendShape.GetBlendShapeChannel(i)
+                for j in range(fbxBlendShapeChannel.GetTargetShapeCount()):
+                    fbxShape = fbxBlendShapeChannel.GetTargetShape(j)
+
+                    blendShapeName = "blendShape" + str(index)
+                    index += 1
+                    blendShapeTarget = newPath + "/" + blendShapeName
+                    blendShapeName = self.asset.makeUniqueBlendShapeName(blendShapeName, newPath)
+                    blendShapes.append(blendShapeName)
+                    blendShapeTargets.append(blendShapeTarget)
+                    usdBlendShape = UsdSkel.BlendShape.Define(self.usdStage, blendShapeTarget)
+
+                    if fbxShape.GetControlPointsCount():
+                        offsets = []
+                        pointIndices = []
+                        for k in range(fbxShape.GetControlPointsCount()):
+                            point = fbxShape.GetControlPointAt(k)
+                            if points[k][0] - point[0] != 0 or points[k][1] - point[1] or points[k][2] - point[2]:
+                                offsets.append(Gf.Vec3f(point[0] - points[k][0], point[1] - points[k][1], point[2] - points[k][2]))
+                                pointIndices.append(k)
+
+                        usdBlendShape.CreateOffsetsAttr(offsets)
+                        usdBlendShape.CreatePointIndicesAttr(pointIndices)
+
+            usdSkelBlendShapeBinding = UsdSkel.BindingAPI(usdMesh)
+            usdSkelBlendShapeBinding.CreateBlendShapesAttr(blendShapes)
+            usdSkelBlendShapeBinding.CreateBlendShapeTargetsRel().SetTargets(blendShapeTargets)
+
+            UsdSkel.BindingAPI.Apply(usdMesh.GetPrim());
+
+            blendShape.addBlendShapeList(blendShapes)
+
+
+    def processBlendShapeAnimations(self):
+        framesCount = int((self.stopAnimationTime - self.startAnimationTime) * self.fps + 0.5) + 1
+        startFrame = int(self.startAnimationTime * self.fps + 0.5)
+
+        if framesCount == 1:
+            return
+
+        blendShapeIdx = 0
+        for fbxNode, blendShape in self.blendShapeByNode.iteritems():
+            fbxBlendShape = self.getFbxBlenShape(fbxNode)
+
+            animationName = self.asset.getAnimationsPath() + '/' + 'BlenShapeAnim'
+            if blendShapeIdx > 0:
+                animationName += '_' + str(blendShapeIdx)
+            if self.verbose:
+                print 'Animation:', animationName
+            blendShapeIdx += 1
+
+            usdSkelAnim = UsdSkel.Animation.Define(self.usdStage, animationName)
+            attr = usdSkelAnim.CreateBlendShapeWeightsAttr()
+
+            for frame in range(framesCount):
+                time = frame / self.fps + self.startAnimationTime
+                values = []
+                for i in range(fbxBlendShape.GetBlendShapeChannelCount()):
+                    fbxBlendShapeChannel = fbxBlendShape.GetBlendShapeChannel(i)
+                    animProperties  = self.findAnimationProperties(fbxBlendShapeChannel)
+                    for animProperty in animProperties:
+                        #channelName = str(fbxProperty.GetName()).strip()
+                        fbxMesh = fbxNode.GetNodeAttribute()
+                        if fbx.FbxNodeAttribute.eSubDiv == fbxMesh.GetAttributeType():
+                            fbxMesh = fbxMesh.GetBaseMesh()
+
+                        fbxTime = fbx.FbxTime()
+                        fbxTime.SetSecondDouble(time)
+                        fbxAnimCurve = animProperty.fbxProperty.GetCurve(animProperty.fbxAnimLayer)
+                        values.append(fbxAnimCurve.Evaluate(fbxTime)[0] / 100.0)  # in percent
+                attr.Set(time = Usd.TimeCode(frame + startFrame), value = values)
+
+            blendShape.setSkeletalAnimation(usdSkelAnim)
+
+        self.shapeBlending.flush()
+
+
+
     def makeUsdStage(self):
         self.usdStage = self.asset.makeUsdStage()
 
@@ -1012,16 +1208,18 @@ class FbxConverter:
         self.processNode(self.fbxScene.GetRootNode(), self.asset.getGeomPath(), None, '')
         self.processSkeletalAnimations()
         self.processSkinnedMeshes()
+        self.processBlendShapes()
+        self.processBlendShapeAnimations()
         self.asset.finalize()
         return self.usdStage
 
 
-def usdStageWithFbx(fbxPath, usdPath, legacyModifier, copyTextures, verbose):
+def usdStageWithFbx(fbxPath, usdPath, legacyModifier, copyTextures, searchPaths, verbose):
     if usdStageWithFbxLoaded == False:
         return None
 
     try:
-        fbxConverter = FbxConverter(fbxPath, usdPath, legacyModifier, copyTextures, verbose)
+        fbxConverter = FbxConverter(fbxPath, usdPath, legacyModifier, copyTextures, searchPaths, verbose)
         return fbxConverter.makeUsdStage()
     except ConvertError:
         return None

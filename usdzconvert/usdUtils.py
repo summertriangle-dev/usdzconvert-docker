@@ -60,7 +60,7 @@ def copy(srcFile, dstFile, verbose=False):
         printWarning("can't find " + srcFile)
 
 
-def resolvePath(textureFileName, folder):
+def resolvePath(textureFileName, folder, searchPaths=None):
     if textureFileName == '':
         return ''
     if os.path.isfile(textureFileName):
@@ -80,6 +80,13 @@ def resolvePath(textureFileName, folder):
         for filename in filenames:
             if filename == basename:
                 return os.path.join(root, filename)
+
+    if searchPaths is not None:
+        for searchPath in searchPaths:
+            for root, dirnames, filenames in os.walk(searchPath):
+                for filename in filenames:
+                    if filename == basename:
+                        return os.path.join(root, filename)
 
     return textureFileName
 
@@ -178,6 +185,17 @@ class Asset:
         return real
 
 
+    def makeUniqueBlendShapeName(self, name, path):
+        geomPath = self.getGeomPath()
+        if len(path) > len(geomPath) and path[:len(geomPath)] == geomPath:
+            path = path[len(geomPath):]
+
+        blendShapeName = path.replace("/", ":") + ":" + name
+        if blendShapeName[0] == ":":
+            blendShapeName = blendShapeName[1:]
+        return blendShapeName
+
+
     def makeUsdStage(self):
         # debug
         # assert self.usdStage is None, 'Trying to create another usdStage'
@@ -222,8 +240,16 @@ class Input:
 
 
 
+class MapTransform:
+    def __init__(self, translation, scale, rotation):
+        self.translation = translation
+        self.scale = scale
+        self.rotation = rotation    
+
+
+
 class Map:
-    def __init__(self, channels, file, fallback=None, texCoordSet='st', wrapS=WrapMode.useMetadata, wrapT=WrapMode.useMetadata, scale = None):
+    def __init__(self, channels, file, fallback=None, texCoordSet='st', wrapS=WrapMode.useMetadata, wrapT=WrapMode.useMetadata, scale=None, transform=None):
         self.file = file
         self.channels = channels
         self.fallback = fallback
@@ -232,6 +258,7 @@ class Map:
         self.wrapS = wrapS
         self.wrapT = wrapT
         self.scale = scale
+        self.transform = transform
 
 
 
@@ -336,6 +363,23 @@ class Material:
             else:
                 uvReader.CreateInput('varname',Sdf.ValueTypeNames.Token).Set(map.texCoordSet)
             uvReader.CreateOutput('result', Sdf.ValueTypeNames.Float2)
+
+        # texture transform
+        if map.transform != None:
+            transformShaderPath = matPath + '/' + map.textureShaderName + '_transform2D'
+            transformShader = UsdShade.Shader.Define(usdStage, transformShaderPath)
+            transformShader.SetSdrMetadataByKey("role", "math")
+            transformShader.CreateIdAttr('UsdTransform2d')
+            transformShader.CreateInput('in', Sdf.ValueTypeNames.Float2).ConnectToSource(uvReader, 'result')
+
+            if map.transform.translation[0] != 0 or map.transform.translation[1] != 0:
+                transformShader.CreateInput('translation', Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(map.transform.translation[0], map.transform.translation[1]))
+            if map.transform.scale[0] != 1 or map.transform.scale[1] != 1:
+                transformShader.CreateInput('scale', Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(map.transform.scale[0], map.transform.scale[1]))
+            if map.transform.rotation != 0:
+                transformShader.CreateInput('rotation', Sdf.ValueTypeNames.Float).Set(float(map.transform.rotation))
+
+            uvReader = transformShader
 
         # create texture shader node
         textureShader = UsdShade.Shader.Define(usdStage, matPath + '/' + map.textureShaderName + '_texture')
@@ -695,5 +739,68 @@ class Skinning:
             if skeleton.getJointIndex(node) != -1:
                 return skeleton
         return None
+
+
+
+class BlendShape:
+    def __init__(self, weightsCount):
+        self.weightsCount = weightsCount
+        self.usdSkeleton = None
+        self.usdSkelAnim = None
+        self.sdfPath = None
+        self.skeleton = None
+        self.blendShapeList = []
+
+
+    def makeUsdSkeleton(self, usdStage, sdfPath):
+        if self.usdSkeleton is not None:
+            return self.usdSkeleton
+        self.sdfPath = sdfPath
+
+        usdGeom = UsdSkel.Root.Define(usdStage, sdfPath)
+
+        self.usdSkeleton = UsdSkel.Skeleton.Define(usdStage, sdfPath + '/Skeleton')
+
+        usdSkelBlendShapeBinding = UsdSkel.BindingAPI(usdGeom)
+        usdSkelBlendShapeBinding.CreateSkeletonRel().AddTarget("Skeleton")
+
+        return usdGeom
+
+
+    def setSkeletalAnimation(self, usdSkelAnim):
+        if self.usdSkelAnim != None:
+            # default animation is the first one
+            return
+
+        if self.usdSkeleton is None:
+            printWarning('trying to assign Skeletal Animation before USD Skeleton has been created.')
+            return
+
+        usdSkelBinding = UsdSkel.BindingAPI(self.usdSkeleton)
+        usdSkelBinding.CreateAnimationSourceRel().AddTarget(usdSkelAnim.GetPath())
+        self.usdSkelAnim = usdSkelAnim
+
+
+    def addBlendShapeList(self, blendShapeList):
+        # TODO: combine lists?
+        self.blendShapeList = blendShapeList
+
+
+
+class ShapeBlending:
+    def __init__(self):
+        self.blendShapes = []
+
+
+    def createBlendShape(self, weightsCount):
+        blendShape = BlendShape(weightsCount)
+        self.blendShapes.append(blendShape)
+        return blendShape
+
+
+    def flush(self):
+        for blendShape in self.blendShapes:
+            if blendShape.usdSkelAnim is not None:
+                blendShape.usdSkelAnim.CreateBlendShapesAttr(blendShape.blendShapeList)
 
 

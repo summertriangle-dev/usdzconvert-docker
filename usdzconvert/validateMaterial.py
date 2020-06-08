@@ -237,25 +237,25 @@ def validateTransform2dNode(shaderNode, verboseOutput, errorData):
     connect = UsdShade.ConnectableAPI.GetConnectedSource(input)
 
     if connect:
-        if not validateConnection(input, connect, verboseOutput):
+        if not validateConnection(input, connect, verboseOutput, errorData):
             return False
         else:
             connectable = UsdShade.Shader(connect[0])
             shaderId = connectable.GetIdAttr().Get()
             if shaderId == "UsdPrimvarReader_float2":
-                if not validatePrimvarReaderNode(connectable, verboseOutput):
+                if not validatePrimvarReaderNode(connectable, verboseOutput, errorData):
                     return False
 
     rotation = shaderNode.GetInput('rotation')
-    if not validateType(rotation, Sdf.ValueTypeNames.Float, shaderPath, verboseOutput):
+    if not validateType(rotation, Sdf.ValueTypeNames.Float, shaderPath, verboseOutput, errorData):
         return False
 
     scale = shaderNode.GetInput('scale')
-    if not validateType(scale, Sdf.ValueTypeNames.Float2, shaderPath, verboseOutput):
+    if not validateType(scale, Sdf.ValueTypeNames.Float2, shaderPath, verboseOutput, errorData):
         return False
 
     translation = shaderNode.GetInput('translation')
-    if not validateType(translation, Sdf.ValueTypeNames.Float2, shaderPath, verboseOutput):
+    if not validateType(translation, Sdf.ValueTypeNames.Float2, shaderPath, verboseOutput, errorData):
         return False
     return True
 

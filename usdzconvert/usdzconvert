@@ -14,14 +14,14 @@ try:
     from pxr import *
     import usdUtils
 except ImportError:
-    usdUtils.printError("failed to import pxr module. Please add path to USD Python bindings to your PYTHONPATH.")
+    print '  \033[91mError: failed to import pxr module. Please add path to USD Python bindings to your PYTHONPATH\033[0m'
     usdLibLoaded = False
 
 __all__ = ['convert']
 
 
 class USDParameters:
-    version = 0.63
+    version = 0.64
     materialsPath = '/Materials'
 
     def __init__(self, usdStage, verbose, url, copyright, assetPath):
@@ -46,9 +46,10 @@ class ParserOut:
         self.verbose = False
         self.copyTextures = False
         self.iOS12 = False
+        self.paths = None
         self.url = ''
         self.copyright = ''
-        self.metersPerUnit = 0
+        self.metersPerUnit = 0.01 # set explicitly for user requests
         self.loop = False
         self.noloop = False
         material = usdUtils.Material('')
@@ -75,6 +76,7 @@ class Parser:
         self.printConvertNameAndVersion()
         print 'usage: usdzconvert inputFile [outputFile]\n\
                    [-h] [-f file] [-v]\n\
+                   [-path path[+path2[...]]]\n\
                    [-url url]\n\
                    [-copyright copyright]\n\
                    [-copytextures]\n\
@@ -117,6 +119,8 @@ Converts 3D model file to usd/usda/usdc/usdz.\n\
   -h, --help            Show this help message and exit.\n\
   -f <file>             Read arguments from <file>\n\
   -v                    Verbose output.\n\
+  -path <path[+path2[...]]>\n\
+                        Add search paths to find textures\n\
   -url <url>            Add URL metadata\n\
   -copyright "copyright message"\n\
                         Add copyright metadata\n\
@@ -319,6 +323,18 @@ examples:\n\
         return Ok
 
 
+    def processPath(self, pathLine):
+        paths = pathLine.split('+')
+        outPath = []
+        for path in paths:
+            if path:
+                if os.path.isdir(path):
+                    outPath.append(path)
+                else:
+                    usdUtils.printWarning("Folder '" + path + "' does not exist. Ignored.")
+        return outPath
+
+
     def parse(self, arguments):
         self.arguments = []
         for arg in arguments:
@@ -346,12 +362,12 @@ examples:\n\
                     self.out.copyTextures = True
                 elif '-iOS12' == argument or '-ios12' == argument:
                     self.out.iOS12 = True
+                elif '-path' == argument:
+                    self.out.paths = self.processPath(self.getParameters(1, argument))
                 elif '-copyright' == argument:
                     self.out.copyright = self.getParameters(1, argument)
-                    print self.out.copyright
                 elif '-url' == argument:
                     self.out.url = self.getParameters(1, argument)
-                    print self.out.url
                 elif '-metersPerUnit' == argument:
                     metersPerUnit = self.getParameters(1, argument)
                     if not isFloat(metersPerUnit) or float(metersPerUnit) <= 0:
@@ -443,7 +459,10 @@ def getAllUsdMaterials(params, usdParentPrim):
                 matPath = str(directBinding.GetMaterialPath())
 
                 if matPath != '':
-                    usdShadeMaterial = directBinding.GetMaterial()
+                    if params.usdStage.GetObjectAtPath(matPath).IsValid():
+                        usdShadeMaterial = directBinding.GetMaterial()
+                    elif params.verbose:
+                        usdUtils.printWarning("Mesh has material '" + matPath + "' which is not exist.");
 
                 if usdShadeMaterial != None and matPath not in params.usdMaterials:
                     params.usdMaterials[matPath] = usdShadeMaterial
@@ -690,7 +709,7 @@ def process(argumentList):
     elif '.fbx' == srcExt:
         global usdStageWithFbx_module
         usdStageWithFbx_module = importlib.import_module("usdStageWithFbx")
-        usdStage = usdStageWithFbx_module.usdStageWithFbx(srcPath, tmpPath, legacyModifier, copyTextures, parserOut.verbose)
+        usdStage = usdStageWithFbx_module.usdStageWithFbx(srcPath, tmpPath, legacyModifier, copyTextures, parserOut.paths, parserOut.verbose)
     elif '.usd' == srcExt or '.usda' == srcExt or '.usdc' == srcExt:
         usdStage = Usd.Stage.Open(srcPath)
         srcIsUsd = True;

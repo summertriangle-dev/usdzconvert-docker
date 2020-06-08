@@ -5,6 +5,7 @@ import struct
 import numpy
 import os.path
 import base64
+import math
 
 import usdUtils
 
@@ -238,12 +239,60 @@ def indicesWithTriangleFan(indices):
     return newIndices
 
 
-def getGfVec3fFromData(data, offset):
+def getGfVec3fFromData(data, offset, elementCount):
     return Gf.Vec3f(float(data[offset]), float(data[offset + 1]), float(data[offset + 2]))
 
 
-def getGfQuatfFromData(data, offset):
+def getGfQuatfFromData(data, offset, elementCount):
     return Gf.Quatf(float(data[offset + 3]), Gf.Vec3f(float(data[offset]), float(data[offset + 1]), float(data[offset + 2])))
+
+
+def getFloatArrayFromData(data, offset, elementCount):
+    elements = []
+    for i in range(elementCount):
+        elements.append(float(data[offset + i]))
+    return Vt.FloatArray(elements)
+
+
+def convertUVTransformForUSD(translation, scale, rotation):
+    inversePivot = Gf.Matrix4d(1)
+    inversePivot[3] = Gf.Vec4d(0, 1, 0, 1)
+
+    scaleMatrix = Gf.Matrix4d(Gf.Vec4d(scale[0], scale[1], 1, 1))
+    inverseScaleMatrix = Gf.Matrix4d(Gf.Vec4d(1.0 / scale[0], 1.0 / scale[1], 1, 1))
+
+    rotationMatrix = Gf.Matrix4d(
+        math.cos(rotation), -math.sin(rotation), 0, 0,
+        math.sin(rotation),  math.cos(rotation), 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1)
+    
+    translateMatrix = Gf.Matrix4d(1)
+    translateMatrix.SetTranslate(Gf.Vec3d(translation[0],translation[1],0))
+    uvTransform = scaleMatrix * rotationMatrix * translateMatrix
+    
+    pivot = Gf.Matrix4d(1)
+    pivot[3] = Gf.Vec4d(0, -1, 0, 1)
+
+    transform = uvTransform * pivot * inverseScaleMatrix * rotationMatrix.GetTranspose() * inversePivot
+
+    transform[0] = rotationMatrix[0] * scale[0]
+    transform[1] = rotationMatrix[1] * scale[1]
+    transform[2] = rotationMatrix[2]
+
+    transform[0] = Gf.Vec4d(transform[0][0], -1.0 * transform[0][1], transform[0][2], transform[0][3])
+    transform[1] = Gf.Vec4d(-1.0 * transform[1][0], transform[1][1], transform[1][2], transform[1][3])
+
+    transform[3] = Gf.Vec4d(transform[3][0], -1.0 * transform[3][1], transform[3][2], transform[3][3])
+
+    translation3d = transform.ExtractTranslation()
+    translation[0] = translation3d[0]
+    translation[1] = translation3d[1]
+
+    rotation3D = transform.ExtractRotationMatrix().GetOrthonormalized().ExtractRotation()
+    rotationVec3d = rotation3D.Decompose(Gf.Vec3d(1,0,0), Gf.Vec3d(0,1,0), Gf.Vec3d(0,0,1))
+    rotation = rotationVec3d[2] # degrees
+    return (translation, scale, rotation)
 
 
 class glTFNodeManager(usdUtils.NodeManager):
@@ -342,6 +391,7 @@ class glTFConverter:
         self.verbose = verbose
         self.legacyModifier = legacyModifier # for iOS 12 compatibility
         self.skeletonByNode = {} # collect skinned mesh to construct later 
+        self.blendShapeByNode = {} # collect meshes with blend shapes to construct later 
         self._worldTransforms = {} # use self.getWorldTransform(nodeIdx)
         self._parents = {} # use self.getParent(nodeIdx)
         self._loadFailed = False
@@ -368,6 +418,7 @@ class glTFConverter:
 
         self.nodeManager = glTFNodeManager(self)
         self.skinning = usdUtils.Skinning(self.nodeManager)
+        self.shapeBlending = usdUtils.ShapeBlending()
 
 
     def load(self, gltfPath):
@@ -455,7 +506,7 @@ class glTFConverter:
         return self.saveTexture(content, image['mimeType'], textureIdx)
 
 
-    def processTexture(self, dict, type, inputName, channels, material, scale = None):
+    def processTexture(self, dict, type, inputName, channels, material, scaleFactor=None):
         if type not in dict:
             return False
 
@@ -520,7 +571,20 @@ class glTFConverter:
                 wrapT = glTFWrappingMode(gltfSampler['wrapT']).usdMode()
 
         primvarName = 'st' if texCoordSet == 0 else 'st' + str(texCoordSet)
-        material.inputs[inputName] = usdUtils.Map(channels, textureFilename, None, primvarName, wrapS, wrapT, scale)
+
+        # texture transform extension: KHR_texture_transform
+        mapTransform = None
+        if 'extensions' in gltfMaterialMap and 'KHR_texture_transform' in gltfMaterialMap['extensions']:
+            gltfTransform = gltfMaterialMap['extensions']['KHR_texture_transform']
+
+            translation = gltfTransform['offset'] if 'offset' in gltfTransform else [0, 0]
+            scale = gltfTransform['scale'] if 'scale' in gltfTransform else [1, 1]
+            rotation = gltfTransform['rotation'] if 'rotation' in gltfTransform else 0
+
+            (translation, scale, rotation) = convertUVTransformForUSD(translation, scale, rotation)
+            mapTransform = usdUtils.MapTransform(translation, scale, rotation)
+
+        material.inputs[inputName] = usdUtils.Map(channels, textureFilename, None, primvarName, wrapS, wrapT, scaleFactor, mapTransform)
         return True
 
 
@@ -565,7 +629,6 @@ class glTFConverter:
                 else:
                     material.opacityThreshold = 0.5 # default by glTF spec
 
-            pbr = None
             if 'pbrMetallicRoughness' in gltfMaterial:
                 pbr = gltfMaterial['pbrMetallicRoughness']
 
@@ -623,8 +686,8 @@ class glTFConverter:
 
             emissiveFactor = gltfMaterial['emissiveFactor'] if 'emissiveFactor' in gltfMaterial else [0.0, 0.0, 0.0]
             if not self.processTexture(gltfMaterial, 'emissiveTexture', usdUtils.InputName.emissiveColor, 'rgb', material, emissiveFactor):
-                if gltfMaterial != None and 'emissiveFactor' in gltfMaterial:
-                    material.inputs[usdUtils.InputName.emissiveColor] = gltfMaterial['emissiveFactor']
+                if 'emissiveFactor' in gltfMaterial:
+                    material.inputs[usdUtils.InputName.emissiveColor] = emissiveFactor
 
             usdMaterial = material.makeUsdMaterial(self.asset)
             self.usdMaterials.append(usdMaterial)
@@ -672,6 +735,33 @@ class glTFConverter:
                 skeleton.makeUsdSkeleton(self.usdStage, self.asset.getGeomPath() + '/RootNodeSkel', self.nodeManager)
 
 
+    def _prepareBlendShape(self, nodeIdx):
+        gltfNode = self.gltf['nodes'][nodeIdx]
+        if 'mesh' in gltfNode:
+            meshIdx = gltfNode['mesh']
+            gltfMesh = self.gltf['meshes'][meshIdx]
+
+            weightsCount = len(gltfMesh['weights']) if 'weights' in gltfMesh else 0
+
+            if 'primitives' in gltfMesh:
+                gltfPrimitives = gltfMesh['primitives']
+
+                for gltfPrimitive in gltfPrimitives:
+                    if 'targets' in gltfPrimitive:
+                        blendShape = self.shapeBlending.createBlendShape(weightsCount)
+                        self.blendShapeByNode[str(nodeIdx)] = blendShape
+                        break
+
+        if 'children' in gltfNode:
+            for childNodeIdx in gltfNode['children']:
+                self._prepareBlendShape(childNodeIdx)
+
+
+    def prepareBlendShapes(self):
+        for childNodeIdx in self.gltf['scenes'][0]['nodes']:
+            self._prepareBlendShape(childNodeIdx)
+
+
     def findSkeletonForAnimation(self, gltfAnim):
         for gltfChannel in gltfAnim['channels']:
             gltfTarget = gltfChannel['target']
@@ -681,6 +771,19 @@ class glTFConverter:
             skeleton = self.skinning.findSkeletonByJoint(str(nodeIdx))
             if skeleton is not None:
                 return skeleton
+        return None
+
+
+    def findBlendShapeForAnimation(self, gltfAnim):
+        for gltfChannel in gltfAnim['channels']:
+            gltfTarget = gltfChannel['target']
+            if 'node' not in gltfTarget:
+                continue
+            nodeIdx = gltfTarget['node']
+            strNodeIdx = str(nodeIdx)
+            if strNodeIdx in self.blendShapeByNode:
+                blendShape = self.blendShapeByNode[strNodeIdx]
+                return blendShape
         return None
 
 
@@ -702,9 +805,10 @@ class glTFConverter:
         self.asset.setFPS(int(1.0 / minTimeInterval))
 
 
-    def getInterpolatedValues(self, interpolation, keyTimesAcc, keyValuesAcc, getValueFromData, timeSet=None):
+    def getInterpolatedValues(self, interpolation, keyTimesAcc, keyValuesAcc, getValueFromData, timeSet=None, elementCount=1):
         values = {}
         data = keyValuesAcc.data
+        valueElementCount = keyValuesAcc.components * elementCount
         if interpolation == 'CUBICSPLINE':
             for el in xrange(keyTimesAcc.count - 1):
                 t0 = self.asset.toTimeCode(keyTimesAcc.data[el], True)
@@ -717,14 +821,14 @@ class glTFConverter:
                 if timeSteps == 0: timeSteps = 1
 
                 # math is described in glTF specification
-                offset = el * keyValuesAcc.components * 3 + keyValuesAcc.components
-                p0 = getValueFromData(data, offset)
-                offset = el * keyValuesAcc.components * 3 + keyValuesAcc.components * 2
-                m0 = getValueFromData(data, offset) * timeRange
-                offset = (el + 1) * keyValuesAcc.components * 3
-                m1 = getValueFromData(data, offset) * timeRange
-                offset = (el + 1) * keyValuesAcc.components * 3 + keyValuesAcc.components
-                p1 = getValueFromData(data, offset)
+                offset = el * valueElementCount * 3 + valueElementCount
+                p0 = getValueFromData(data, offset, elementCount)
+                offset = el * valueElementCount * 3 + valueElementCount * 2
+                m0 = getValueFromData(data, offset, elementCount) * timeRange
+                offset = (el + 1) * valueElementCount * 3
+                m1 = getValueFromData(data, offset, elementCount) * timeRange
+                offset = (el + 1) * valueElementCount * 3 + valueElementCount
+                p1 = getValueFromData(data, offset, elementCount)
 
                 for timeStep in xrange(timeSteps):
                     t = float(timeStep) / timeSteps
@@ -739,22 +843,22 @@ class glTFConverter:
 
             el = keyTimesAcc.count - 1
             time = self.asset.toTimeCode(keyTimesAcc.data[el], True)
-            offset = el * keyValuesAcc.components * 3 + keyValuesAcc.components
-            values[time] = getValueFromData(data, offset)
+            offset = el * valueElementCount * 3 + valueElementCount
+            values[time] = getValueFromData(data, offset, elementCount)
             if timeSet is not None:
                 timeSet.add(time)
         else:
             if interpolation == 'STEP':
                 for el in xrange(1, keyTimesAcc.count):
                     time = self.asset.toTimeCode(keyTimesAcc.data[el], True) - 1
-                    offset = (el - 1) * keyValuesAcc.components
-                    values[time] = getValueFromData(data, offset)
+                    offset = (el - 1) * valueElementCount
+                    values[time] = getValueFromData(data, offset, elementCount)
                     if timeSet is not None:
                         timeSet.add(time)
             for el in xrange(keyTimesAcc.count):
                 time = self.asset.toTimeCode(keyTimesAcc.data[el], True)
-                offset = el * keyValuesAcc.components
-                values[time] = getValueFromData(data, offset)
+                offset = el * valueElementCount
+                values[time] = getValueFromData(data, offset, elementCount)
                 if timeSet is not None:
                     timeSet.add(time)
 
@@ -904,6 +1008,40 @@ class glTFConverter:
             self.usdSkelAnims.append(usdSkelAnim)
 
 
+    def processBlendShapeAnimations(self):
+        for gltfAnim in self.gltf['animations'] if 'animations' in self.gltf else []:
+
+            blendShape = self.findBlendShapeForAnimation(gltfAnim)
+            if blendShape is None:
+                continue
+
+            name = getName(gltfAnim, 'skelAnim_', len(self.usdSkelAnims))
+            animationPath = self.asset.getAnimationsPath() + '/' + name
+            usdSkelAnim = UsdSkel.Animation.Define(self.usdStage, animationPath)
+
+            attr = usdSkelAnim.CreateBlendShapeWeightsAttr()
+
+            for gltfChannel in gltfAnim['channels']:
+                gltfTarget = gltfChannel['target']
+                strNodeIdx = str(gltfTarget['node'])
+
+                targetPath = gltfTarget['path']
+                samplerIdx = gltfChannel['sampler']
+                gltfSampler = gltfAnim['samplers'][samplerIdx]
+                interpolation = gltfSampler['interpolation'] if 'interpolation' in gltfSampler else 'LINEAR'
+                keyTimesAcc = Accessor(self, gltfSampler['input'])
+                keyValuesAcc = Accessor(self, gltfSampler['output'])
+
+                if targetPath == 'weights':
+                    values = self.getInterpolatedValues(interpolation, keyTimesAcc, keyValuesAcc, getFloatArrayFromData, None, blendShape.weightsCount)
+                    for time, value in values.iteritems():
+                        attr.Set(time = time, value = value)
+
+            blendShape.setSkeletalAnimation(usdSkelAnim)
+            self.usdSkelAnims.append(usdSkelAnim)
+
+
+
     def processPrimitive(self, nodeIdx, gltfPrimitive, path, skinIdx, skeleton):
         mode = gltfPrimitive['mode'] if 'mode' in gltfPrimitive else gltfPrimitiveMode.TRIANGLES
 
@@ -1044,6 +1182,73 @@ class glTFConverter:
             if 'doubleSided' in gltfMaterial and gltfMaterial['doubleSided'] == True:
                 usdMesh.CreateDoubleSidedAttr(True)
 
+        hasBlendShapes = True if 'targets' in gltfPrimitive else False
+        if hasBlendShapes:
+            targets = gltfPrimitive['targets']
+            blendShapes = []
+            blendShapeTargets = []
+            for target in targets:
+                blendShapeName = "blendShape" + str(targets.index(target))
+                blendShapeTarget = path + "/" + blendShapeName
+                blendShapeName = self.asset.makeUniqueBlendShapeName(blendShapeName, path)
+                blendShapes.append(blendShapeName)
+                blendShapeTargets.append(blendShapeTarget)
+                usdBlendShape = UsdSkel.BlendShape.Define(self.usdStage, blendShapeTarget)
+
+                positions = None
+                positionsLen = 0
+                normals = None
+                normalsLen = 0
+                for key in target:
+                    if key == 'POSITION':
+                        accessor = Accessor(self, target[key])
+                        positions = accessor.data
+                        positionsLen = len(positions) / 3
+                    elif key == 'NORMAL':
+                        accessor = Accessor(self, target[key])
+                        normals = accessor.data
+                        normalsLen = len(normals) / 3
+
+                offsets = []
+                normalOffsets = []
+                pointIndices = []
+                pointsCount = max(positionsLen, normalsLen)
+
+                for idx in range (pointsCount):
+                    if ((positionsLen and (positions[idx*3] != 0 or positions[idx*3 + 1] != 0 or positions[idx*3 + 2] != 0)) or
+                        (normalsLen and (normals[idx*3] != 0 or normals[idx*3 + 1] != 0 or normals[idx*3 + 2] != 0))):
+
+                        if positionsLen:
+                            offsets.append(Gf.Vec3f(
+                                float(positions[idx*3]), 
+                                float(positions[idx*3 + 1]), 
+                                float(positions[idx*3 + 2])))
+
+                        if normalsLen:
+                            normalOffsets.append(Gf.Vec3f(
+                                float(normals[idx*3]), 
+                                float(normals[idx*3 + 1]), 
+                                float(normals[idx*3 + 2])))
+
+                        pointIndices.append(idx)
+
+                if positionsLen:
+                    usdBlendShape.CreateOffsetsAttr(offsets)
+                if normalsLen:
+                    usdBlendShape.CreateNormalOffsetsAttr(normalOffsets)
+                usdBlendShape.CreatePointIndicesAttr(pointIndices)
+
+            usdSkelBlendShapeBinding = UsdSkel.BindingAPI(usdMesh)
+            usdSkelBlendShapeBinding.CreateBlendShapesAttr(blendShapes)
+            usdSkelBlendShapeBinding.CreateBlendShapeTargetsRel().SetTargets(blendShapeTargets)
+
+            UsdSkel.BindingAPI.Apply(usdMesh.GetPrim());
+
+            strNodeIdx = str(nodeIdx)
+            if strNodeIdx in self.blendShapeByNode:
+                blendShape = self.blendShapeByNode[strNodeIdx]
+                blendShape.addBlendShapeList(blendShapes)
+
         return usdMesh
 
 
@@ -1085,8 +1290,14 @@ class glTFConverter:
             newPath = path + '/' + name
 
         usdGeom = None
+        strNodeIdx = str(nodeIdx)
         skeleton = self.skinning.findSkeletonByRoot(str(nodeIdx))
-        if skeleton is not None:
+        blendShape = self.blendShapeByNode[strNodeIdx] if strNodeIdx in self.blendShapeByNode else None
+        if blendShape is not None:
+            if self.verbose:
+                print indent + 'SkelRoot for Blend Shape:', name
+            usdGeom = blendShape.makeUsdSkeleton(self.usdStage, newPath)
+        elif skeleton is not None:
             if self.verbose:
                 print indent + 'SkelRoot:', name
             usdGeom = skeleton.makeUsdSkeleton(self.usdStage, newPath, self.nodeManager)
@@ -1187,6 +1398,12 @@ class glTFConverter:
                     xformOp = getXformOp(usdGeom, UsdGeom.XformOp.TypeScale)
                     if xformOp == None:
                         xformOp = usdGeom.AddScaleOp()
+                elif targetPath == 'weights':
+                    pass
+                else:
+                    if self.verbose:
+                        usdUtils.printWarning("Animation: unsupported target path: " + targetPath)
+                    continue
 
                 if xformOp == None:
                     continue
@@ -1216,6 +1433,24 @@ class glTFConverter:
                 self.usdGeoms[nodeIdx] = usdGeom
 
 
+    def processBlendShapeMeshes(self):
+        for strNodeIdx, blendShape in self.blendShapeByNode.iteritems():
+            if strNodeIdx in self.skeletonByNode:
+                continue # avoid nodes with skeletons
+            nodeIdx = int(strNodeIdx)
+            gltfNode = self.gltf['nodes'][nodeIdx]
+
+            name = getName(gltfNode, 'node_', nodeIdx)
+            if name in self.nodeNames:
+                name = name + '_' + str(nodeIdx)
+            self.nodeNames[name] = name
+
+            newPath = blendShape.sdfPath + '/' + name
+            usdGeom = self.processMesh(nodeIdx, newPath, None)
+            if usdGeom is not None:
+                self.usdGeoms[nodeIdx] = usdGeom
+
+
     def makeUsdStage(self):
         if self._loadFailed:
             return None
@@ -1225,11 +1460,15 @@ class glTFConverter:
             self.usdStage.SetMetadata("metersPerUnit", 1)
         self.createMaterials()
         self.prepareSkinning()
+        self.prepareBlendShapes()
         self.prepareAnimations()
         self.processNodeChildren(self.gltf['scenes'][0]['nodes'], self.asset.getGeomPath(), None)
         self.processSkeletonAnimation()
+        self.processBlendShapeAnimations()
         self.processSkinnedMeshes()
+        self.processBlendShapeMeshes()
         self.processNodeTransformAnimation()
+        self.shapeBlending.flush()
         self.asset.finalize()
         return self.usdStage
 
