@@ -4,7 +4,8 @@ WORKDIR /build
 
 RUN apt-get update
 RUN apt-get -y install git build-essential python-dev cmake libtbb-dev libboost-program-options-dev libboost-python-dev python-jinja2
-RUN git clone --depth=1 https://github.com/PixarAnimationStudios/USD
+RUN git clone --no-checkout https://github.com/PixarAnimationStudios/USD
+RUN cd USD && git checkout v20.05
 
 RUN cmake \
     -DCMAKE_INSTALL_PREFIX=/usr/local/USD \
