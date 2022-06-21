@@ -5,7 +5,7 @@ This is a Docker image for running Apple's USD tools.
 The usdzconvert tool included in this repo is copied directly from USDPython 0.63; 
 the full installer is available from developer.apple.com. 
 
-The original license for USDPython is in LICENSE.txt.
+The original license for USDPython is in `usdzconvert/LICENSE.txt`.
 
 ### Example usage:
 
